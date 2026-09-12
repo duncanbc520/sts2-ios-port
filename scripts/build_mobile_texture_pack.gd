@@ -103,6 +103,9 @@ func _init() -> void:
 			failures += 1
 		else:
 			manifest_file.store_string(JSON.stringify(manifest, "  "))
+			# PCKPacker reads the source file immediately. Flush explicitly so the
+			# manifest is not captured as a zero-byte entry on Windows.
+			manifest_file.flush()
 			manifest_file = null
 			var manifest_add_error := packer.add_file(MANIFEST_PACK_PATH, manifest_file_path, false)
 			if manifest_add_error != OK:
