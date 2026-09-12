@@ -195,6 +195,19 @@ public partial class STS2Bootstrapper : Node
                 GD.PrintErr(line);
                 try { System.IO.File.AppendAllText(LogFilePath, line + "\n"); } catch { }
 
+                if (text != null && text.StartsWith("PHYS stage=", StringComparison.Ordinal))
+                {
+                    RecordNativeFootprintStage(text.Substring("PHYS stage=".Length));
+                }
+                else if (text != null && text.StartsWith("AtlasManager: Loaded ", StringComparison.Ordinal))
+                {
+                    RecordNativeFootprintStage("atlas_loaded_" + text.Substring("AtlasManager: Loaded ".Length).Split(' ')[0]);
+                }
+                else if (text != null && text.Contains("Resource stats (main menu loaded (essential))", StringComparison.Ordinal))
+                {
+                    RecordNativeFootprintStage("main_menu_essential_assets_loaded");
+                }
+
                 // Prevent missed asset unload thrashing
                 if (text != null && text.Contains("Asset was not cached:"))
                 {
@@ -238,6 +251,7 @@ public partial class STS2Bootstrapper : Node
     }
 
     private double _memoryLogTimer = 0;
+    private double _nativeMemoryLogTimer = 0;
     private double _startupTelemetryElapsed = 0;
     private double _maintenanceTimer = 0;
     private int _periodicMemorySample = 0;
@@ -250,6 +264,8 @@ public partial class STS2Bootstrapper : Node
             long peakMem = (long)OS.GetStaticMemoryPeakUsage();
             long vram = (long)RenderingServer.GetRenderingInfo(RenderingServer.RenderingInfo.VideoMemUsed);
             long gcMem = GC.GetTotalMemory(false);
+            long footprint = IosPhysicalFootprint.TryGetPhysicalFootprintBytes(out long sampledFootprint)
+                ? sampledFootprint : -1;
             long workingSet = -1;
             long privateBytes = -1;
             try
@@ -262,7 +278,8 @@ public partial class STS2Bootstrapper : Node
 
             string line = $"[{DateTime.UtcNow:HH:mm:ss.fff}] [MEM] stage={stage} " +
                 $"Static={ToMb(staticMem):F1}MB Peak={ToMb(peakMem):F1}MB VRAM={ToMb(vram):F1}MB " +
-                $"GC={ToMb(gcMem):F1}MB WorkingSet={ToMb(workingSet):F1}MB Private={ToMb(privateBytes):F1}MB";
+                $"GC={ToMb(gcMem):F1}MB WorkingSet={ToMb(workingSet):F1}MB Private={ToMb(privateBytes):F1}MB " +
+                $"PhysicalFootprint={ToMb(footprint):F1}MB";
             GD.PrintErr($"[STS2Bootstrapper] {line}");
             if (!string.IsNullOrEmpty(LogFilePath))
             {
@@ -276,6 +293,18 @@ public partial class STS2Bootstrapper : Node
     }
 
     private static double ToMb(long bytes) => bytes < 0 ? -1 : bytes / 1048576.0;
+
+    private static void RecordNativeFootprintStage(string stage)
+    {
+        long footprint = IosPhysicalFootprint.TryGetPhysicalFootprintBytes(out long bytes) ? bytes : -1;
+        string line = $"[{DateTime.UtcNow:HH:mm:ss.fff}] [PHYS] pid={Environment.ProcessId} stage={stage} " +
+            $"PhysicalFootprint={ToMb(footprint):F1}MB";
+        GD.PrintErr($"[STS2Bootstrapper] {line}");
+        if (!string.IsNullOrEmpty(LogFilePath))
+        {
+            try { System.IO.File.AppendAllText(LogFilePath, line + "\n"); } catch { }
+        }
+    }
 
     public override void _Notification(int what)
     {
@@ -305,6 +334,15 @@ public partial class STS2Bootstrapper : Node
     public override void _Process(double delta)
     {
         _startupTelemetryElapsed += delta;
+        if (_startupTelemetryElapsed >= 7.0 && _startupTelemetryElapsed <= 18.0)
+        {
+            _nativeMemoryLogTimer += delta;
+            if (_nativeMemoryLogTimer >= 0.2)
+            {
+                _nativeMemoryLogTimer = 0;
+                RecordNativeFootprintStage("transition_sample");
+            }
+        }
         _maintenanceTimer += delta;
         if (_maintenanceTimer >= 1.0)
         {
@@ -414,7 +452,52 @@ public partial class STS2Bootstrapper : Node
                     added++;
                 }
             }
-            GD.PrintErr($"[STS2Bootstrapper] Registered {added} missing controller actions in InputMap. Total now: {actions.Length}");
+
+            // Match the shipped project's raw controller actions. GodotControllerInputStrategy
+            // polls these names before translating analog directions into controller_* actions.
+            var rawBindings = new (string Action, JoyAxis Axis, float AxisValue)[]
+            {
+                ("raw_l_stick_left", JoyAxis.LeftX, -1f),
+                ("raw_l_stick_right", JoyAxis.LeftX, 1f),
+                ("raw_l_stick_up", JoyAxis.LeftY, -1f),
+                ("raw_l_stick_down", JoyAxis.LeftY, 1f),
+                ("raw_r_stick_left", JoyAxis.RightX, -1f),
+                ("raw_r_stick_right", JoyAxis.RightX, 1f),
+                ("raw_r_stick_up", JoyAxis.RightY, -1f),
+                ("raw_r_stick_down", JoyAxis.RightY, 1f),
+                ("raw_left_trigger", JoyAxis.TriggerLeft, 1f),
+                ("raw_right_trigger", JoyAxis.TriggerRight, 1f),
+            };
+            int rawAdded = 0;
+            int rawDeadzoneUpdated = 0;
+            int rawBindingsAdded = 0;
+            foreach (var binding in rawBindings)
+            {
+                StringName action = binding.Action;
+                if (!InputMap.HasAction(action))
+                {
+                    InputMap.AddAction(action, 0.5f);
+                    rawAdded++;
+                }
+                else if (!Mathf.IsEqualApprox(InputMap.ActionGetDeadzone(action), 0.5f))
+                {
+                    InputMap.ActionSetDeadzone(action, 0.5f);
+                    rawDeadzoneUpdated++;
+                }
+
+                var motion = new InputEventJoypadMotion
+                {
+                    Axis = binding.Axis,
+                    AxisValue = binding.AxisValue,
+                };
+                if (!InputMap.ActionHasEvent(action, motion))
+                {
+                    InputMap.ActionAddEvent(action, motion);
+                    rawBindingsAdded++;
+                }
+            }
+
+            GD.PrintErr($"[STS2Bootstrapper] Registered {added} missing controller actions in InputMap. Total now: {actions.Length}; raw actions added: {rawAdded}, deadzones updated: {rawDeadzoneUpdated}, bindings added: {rawBindingsAdded}");
         }
         catch (Exception ex)
         {
