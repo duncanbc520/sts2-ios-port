@@ -297,7 +297,7 @@ public partial class STS2Bootstrapper : Node
     private static void RecordNativeFootprintStage(string stage)
     {
         long footprint = IosPhysicalFootprint.TryGetPhysicalFootprintBytes(out long bytes) ? bytes : -1;
-        string line = $"[{DateTime.UtcNow:HH:mm:ss.fff}] [PHYS] pid={Environment.ProcessId} stage={stage} " +
+        string line = $"[{DateTime.UtcNow:HH:mm:ss.fff}] [PHYS] pid={System.Environment.ProcessId} stage={stage} " +
             $"PhysicalFootprint={ToMb(footprint):F1}MB";
         GD.PrintErr($"[STS2Bootstrapper] {line}");
         if (!string.IsNullOrEmpty(LogFilePath))
