@@ -34,7 +34,10 @@ func _load(path: String, _original_path: String, _use_sub_threads: bool, _cache_
 		if decompress_error != OK:
 			printerr("custom image decompress failed: ", decompress_error)
 			return decompress_error
-	var compress_error: Error = image.compress(Image.COMPRESS_ASTC, Image.COMPRESS_SOURCE_GENERIC, 0)
+	# ASTC 8x8 is supported by iOS and uses one quarter of the storage/VRAM of
+	# ASTC 4x4. The original desktop S3TC/BPTC textures can otherwise expand to
+	# RGBA8 on iOS and trigger a Jetsam high-water kill during atlas loading.
+	var compress_error: Error = image.compress(Image.COMPRESS_ASTC, Image.COMPRESS_SOURCE_GENERIC, 1)
 	if compress_error != OK:
 		printerr("custom image ASTC compress failed: ", compress_error)
 		return compress_error
