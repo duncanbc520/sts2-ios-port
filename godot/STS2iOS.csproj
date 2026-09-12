@@ -48,6 +48,10 @@
       <HintPath>$(MSBuildThisFileDirectory)lib/Sentry.dll</HintPath>
       <Private>true</Private>
     </Reference>
+    <Reference Include="Sentry.Godot">
+      <HintPath>$(MSBuildThisFileDirectory)lib/Sentry.Godot.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
     <Reference Include="SmartFormat">
       <HintPath>$(MSBuildThisFileDirectory)lib/SmartFormat.dll</HintPath>
       <Private>true</Private>

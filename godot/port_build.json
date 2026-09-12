@@ -1,0 +1,13 @@
+{
+  "port_build_id": "memfix-local",
+  "game_version": "v0.111.0",
+  "game_commit": "41cef1ea",
+  "steam_build_id": "24724944",
+  "expected_pck_bytes": 1990705700,
+  "expected_pck_sha256": "C60F672EE7804E6AEFA1E19A582FA1C80B126A7B0EEF4D084D3ABF110DF2EAB7",
+  "expected_sts2_dll_sha256": "0861BFA1DF347538D932F22D580E75420F08082792EB914E53B4882764ACDBE9",
+  "expected_sentry_dll_sha256": "4F1619B048D0B0F604265075BC5311F9F2E4A0ECDC09662009B7EE11D50C216C",
+  "expected_sentry_godot_dll_sha256": "BEF522B322662F6DBF280891E23E2001483107F8BB981F1692C264928753112A",
+  "texture_cache_schema": 2,
+  "texture_count": 3564
+}

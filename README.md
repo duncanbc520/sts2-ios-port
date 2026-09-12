@@ -1,6 +1,8 @@
 ﻿# Slay the Spire 2 - iOS Port & AltStore Sideload Guide
 
-This repository contains the complete iOS port project and automated GitHub Actions build pipeline for **Slay the Spire 2** (Godot 4.5.1 / .NET 9).
+This repository contains the iOS port project and automated GitHub Actions build pipeline for **Slay the Spire 2** (Godot 4.5.2 / .NET 9).
+
+The current port is pinned to the Steam `public-beta` build `24724944`: game version `v0.111.0`, commit `41cef1ea`. Mixing game files from another release is not supported.
 
 ---
 
@@ -32,19 +34,32 @@ This repository contains the complete iOS port project and automated GitHub Acti
 
 ---
 
-## Step 2: Choose How to Supply Game Assets (`SlayTheSpire2.pck`)
+## Step 2: Supply Matched Game Data and the Mobile Texture Cache
 
-The game assets (`SlayTheSpire2.pck`, ~1.9 GB) can be provided in either of two ways:
+Use `SlayTheSpire2.pck`, `sts2.dll`, `Sentry.dll`, and `Sentry.Godot.dll` from the same game installation. The build verifies the three managed assemblies, and the app verifies the PCK size plus the cache manifest before launch.
 
-### Option A: Via the iOS Files App / iTunes (Recommended - Fastest)
+Build the required ASTC 8×8 cache with the Godot 4.5.2 Mono console executable:
+
+```powershell
+Godot_v4.5.2-stable_mono_win64_console.exe --headless --path godot --script scripts/build_mobile_texture_pack.gd -- "C:\path\to\SlayTheSpire2.pck" "C:\path\to\SlayTheSpire2-Mobile.pck"
+```
+
+Then copy both files to the app through iTunes/Finder File Sharing or the iOS Files app:
+
+- `SlayTheSpire2.pck`
+- `SlayTheSpire2-Mobile.pck`
+
+The mobile cache is mandatory. The port intentionally refuses to fall back to desktop BPTC/DXT textures because iOS would expand them to RGBA8 and can terminate the app for excessive memory use.
+
+### Option A: Via the iOS Files App / iTunes (Recommended)
 1. Push the repository as-is without uploading the 1.9 GB PCK to GitHub.
-2. The GitHub Action will build a lightweight runner `.ipa` (~50 MB).
+2. The GitHub Action will build the runner `.ipa`.
 3. Sideload the `.ipa` using AltStore.
 4. On your iPhone, open the **Files** app $\rightarrow$ **On My iPhone** $\rightarrow$ **Slay the Spire 2**.
-5. Copy `SlayTheSpire2.pck` from your PC (`E:\SteamLibrary\steamapps\common\Slay the Spire 2\SlayTheSpire2.pck`) into that folder (using AirDrop, iTunes/Finder File Sharing, iCloud Drive, or LocalSend).
+5. Copy both matched PCK files into that folder.
 6. Launch the game!
 
-### Option B: Bundle Assets Directly into the IPA (All-in-One)
+### Option B: Bundle the Desktop Game PCK
 1. Before pushing to GitHub, run our PCK splitter script:
    ```powershell
    python scripts\split_pck.py
@@ -56,7 +71,7 @@ The game assets (`SlayTheSpire2.pck`, ~1.9 GB) can be provided in either of two 
    git commit -m "Add split game assets"
    git push
    ```
-3. GitHub Actions will reassemble the parts during the build and produce a self-contained IPA containing all audio and art assets.
+3. GitHub Actions will reassemble the desktop PCK during the build. The generated `SlayTheSpire2-Mobile.pck` must still be copied through File Sharing unless you also extend the private workflow to bundle it.
 
 ---
 
@@ -65,7 +80,7 @@ The game assets (`SlayTheSpire2.pck`, ~1.9 GB) can be provided in either of two 
 1. In your GitHub repository, click on the **Actions** tab.
 2. Select the latest run of the **Build iOS IPA** workflow.
 3. Once finished, scroll down to the **Artifacts** section at the bottom.
-4. Download `SlayTheSpire2-iOS-ipa.zip` and extract `SlayTheSpire2-iOS.ipa`.
+4. Download the newest `SlayTheSpire2-iOS-ipa-<run>.zip` and extract the `SlayTheSpire2-iOS-memfix-<commit>.ipa` inside it.
 
 ---
 

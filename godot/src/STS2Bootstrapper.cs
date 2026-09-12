@@ -46,6 +46,7 @@ public partial class STS2Bootstrapper : Node
     {
         Instance = this;
         InitFileLogger();
+        RecordMemoryStage("enter_tree_before_registration");
         ConfigureJsonSerialization();
         RegisterSts2Scripts();
         RegisterInputMapActions();
@@ -54,12 +55,14 @@ public partial class STS2Bootstrapper : Node
         ConfigureMemoryManagement();
         HookSceneTree();
         EnforceFullscreenAndTouchSettings();
+        RecordMemoryStage("enter_tree_after_registration");
     }
 
     public override void _Ready()
     {
         base._Ready();
         EnforceFullscreenAndTouchSettings();
+        RecordMemoryStage("autoload_ready");
     }
 
     // ==========================================
@@ -161,6 +164,7 @@ public partial class STS2Bootstrapper : Node
     public void EnsureRegistered()
     {
         InitFileLogger();
+        RecordMemoryStage("ensure_registered_before");
         ConfigureJsonSerialization();
         RegisterSts2Scripts();
         RegisterInputMapActions();
@@ -169,6 +173,7 @@ public partial class STS2Bootstrapper : Node
         ConfigureMemoryManagement();
         HookSceneTree();
         EnforceFullscreenAndTouchSettings();
+        RecordMemoryStage("ensure_registered_after");
     }
 
     public static void InitFileLogger()
@@ -233,12 +238,51 @@ public partial class STS2Bootstrapper : Node
     }
 
     private double _memoryLogTimer = 0;
+    private double _startupTelemetryElapsed = 0;
+    private double _maintenanceTimer = 0;
+    private int _periodicMemorySample = 0;
+
+    public void RecordMemoryStage(string stage)
+    {
+        try
+        {
+            long staticMem = (long)OS.GetStaticMemoryUsage();
+            long peakMem = (long)OS.GetStaticMemoryPeakUsage();
+            long vram = (long)RenderingServer.GetRenderingInfo(RenderingServer.RenderingInfo.VideoMemUsed);
+            long gcMem = GC.GetTotalMemory(false);
+            long workingSet = -1;
+            long privateBytes = -1;
+            try
+            {
+                using var process = System.Diagnostics.Process.GetCurrentProcess();
+                workingSet = process.WorkingSet64;
+                privateBytes = process.PrivateMemorySize64;
+            }
+            catch { }
+
+            string line = $"[{DateTime.UtcNow:HH:mm:ss.fff}] [MEM] stage={stage} " +
+                $"Static={ToMb(staticMem):F1}MB Peak={ToMb(peakMem):F1}MB VRAM={ToMb(vram):F1}MB " +
+                $"GC={ToMb(gcMem):F1}MB WorkingSet={ToMb(workingSet):F1}MB Private={ToMb(privateBytes):F1}MB";
+            GD.PrintErr($"[STS2Bootstrapper] {line}");
+            if (!string.IsNullOrEmpty(LogFilePath))
+            {
+                try { System.IO.File.AppendAllText(LogFilePath, line + "\n"); } catch { }
+            }
+        }
+        catch (Exception ex)
+        {
+            GD.PrintErr($"[STS2Bootstrapper] Memory telemetry failed at {stage}: {ex.Message}");
+        }
+    }
+
+    private static double ToMb(long bytes) => bytes < 0 ? -1 : bytes / 1048576.0;
 
     public override void _Notification(int what)
     {
         // 2009 is NotificationOsMemoryWarning in Godot
         if (what == 2009)
         {
+            RecordMemoryStage("low_memory_warning_before_cleanup");
             GD.PrintErr("[STS2Bootstrapper] OS Low Memory Warning received! Dropping caches and collecting GC heap...");
             try
             {
@@ -250,6 +294,7 @@ public partial class STS2Bootstrapper : Node
                 GC.Collect(2, GCCollectionMode.Aggressive, true, true);
             }
             catch { }
+            RecordMemoryStage("low_memory_warning_after_cleanup");
         }
         else if (what == (int)Window.NotificationWMSizeChanged || what == 1005 /* NotificationResized */)
         {
@@ -259,43 +304,34 @@ public partial class STS2Bootstrapper : Node
 
     public override void _Process(double delta)
     {
-        EnforceFullscreenAndTouchSettings();
-        ClearMissedCacheAssets();
-
-        _memoryLogTimer += delta;
-        if (_memoryLogTimer >= 10.0)
+        _startupTelemetryElapsed += delta;
+        _maintenanceTimer += delta;
+        if (_maintenanceTimer >= 1.0)
         {
-            _memoryLogTimer = 0;
+            _maintenanceTimer = 0;
+            EnforceFullscreenAndTouchSettings();
+            ClearMissedCacheAssets();
+
+            // On iOS without an external gamepad, keep the game in mouse/touch mode.
+            // v0.111.0 replaced IsUsingController with the public ForceMouseMode API.
             try
             {
-                long staticMem = (long)OS.GetStaticMemoryUsage();
-                long vram = (long)RenderingServer.GetRenderingInfo(RenderingServer.RenderingInfo.VideoMemUsed);
-                long gcMem = GC.GetTotalMemory(false);
-                GD.PrintErr($"[STS2Bootstrapper] Memory Telemetry: Static={staticMem / (1024 * 1024)}MB, VRAM={vram / (1024 * 1024)}MB, GC={gcMem / (1024 * 1024)}MB");
+                var ctrlMgr = MegaCrit.Sts2.Core.Nodes.CommonUi.NControllerManager.Instance;
+                if (ctrlMgr != null && Input.GetConnectedJoypads().Count == 0)
+                {
+                    ctrlMgr.ForceMouseMode();
+                }
             }
             catch { }
         }
 
-        // On iOS without an external gamepad, force mouse/touch mode if NControllerManager accidentally engages controller mode
-        try
+        _memoryLogTimer += delta;
+        double telemetryInterval = _startupTelemetryElapsed <= 45.0 ? 1.0 : 10.0;
+        if (_memoryLogTimer >= telemetryInterval)
         {
-            var ctrlMgr = MegaCrit.Sts2.Core.Nodes.CommonUi.NControllerManager.Instance;
-            if (ctrlMgr != null && ctrlMgr.IsUsingController && Input.GetConnectedJoypads().Count == 0)
-            {
-                var field = typeof(MegaCrit.Sts2.Core.Nodes.CommonUi.NControllerManager)
-                    .GetField("<IsUsingController>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic);
-                if (field != null)
-                {
-                    field.SetValue(ctrlMgr, false);
-                    ctrlMgr.EmitSignal(MegaCrit.Sts2.Core.Nodes.CommonUi.NControllerManager.SignalName.MouseDetected);
-                    var method = typeof(MegaCrit.Sts2.Core.Nodes.CommonUi.NControllerManager)
-                        .GetMethod("ControlModeChanged", BindingFlags.Instance | BindingFlags.NonPublic);
-                    method?.Invoke(ctrlMgr, null);
-                    GD.Print("[STS2Bootstrapper] Reset NControllerManager to Touch/Mouse mode.");
-                }
-            }
+            _memoryLogTimer = 0;
+            RecordMemoryStage($"periodic_{++_periodicMemorySample}");
         }
-        catch { }
     }
 
     private static bool _fullscreenLogged = false;
@@ -327,8 +363,9 @@ public partial class STS2Bootstrapper : Node
             ProjectSettings.SetSetting("display/window/ios/hide_home_indicator", true);
             ProjectSettings.SetSetting("display/window/ios/hide_status_bar", true);
 
-            // Hide mouse cursor on mobile touch screen to avoid NCursorManager per-touch bitmap updates
-            if (Input.MouseMode != Input.MouseModeEnum.Hidden)
+            // iOS has no mouse mode. Setting it there emits an error every frame and
+            // creates thousands of avoidable backtraces in the system log.
+            if (OS.GetName() != "iOS" && Input.MouseMode != Input.MouseModeEnum.Hidden)
             {
                 Input.MouseMode = Input.MouseModeEnum.Hidden;
             }
@@ -1029,15 +1066,16 @@ public partial class STS2Bootstrapper : Node
                 _isMapActive = false;
                 _isMapPanning = false;
                 try { System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency; } catch { }
-                PrewarmCombatEssentials();
-                PrewarmMonsterIntents();
-                Callable.From(TryPreloadCurrentRunCharacter).CallDeferred();
+                // Keep combat assets on demand on iOS. The previous eager character,
+                // VFX, and intent warmups retained hundreds of resources at once.
+                Instance?.RecordMemoryStage("combat_room_entered_on_demand");
             }
             else if (node is MegaCrit.Sts2.Core.Nodes.NRun nRun)
             {
-                Callable.From(TryPreloadCurrentRunCharacter).CallDeferred();
+                Instance?.RecordMemoryStage("run_entered_on_demand");
                 nRun.TreeExiting += () =>
                 {
+                    Instance?.RecordMemoryStage("run_exit_before_cleanup");
                     GD.PrintErr("[STS2Bootstrapper] NRun exiting tree. Freeing in-run caches and running GC...");
                     _preloadedCharacters.Clear();
                     _permanentAssetCache.Clear();
@@ -1052,10 +1090,12 @@ public partial class STS2Bootstrapper : Node
                         GC.Collect(2, GCCollectionMode.Aggressive, true, true);
                     }
                     catch { }
+                    Instance?.RecordMemoryStage("run_exit_after_cleanup");
                 };
             }
             else if (node is MegaCrit.Sts2.Core.Nodes.Screens.MainMenu.NMainMenu)
             {
+                Instance?.RecordMemoryStage("main_menu_before_cleanup");
                 GD.PrintErr("[STS2Bootstrapper] Main Menu opened. Freeing in-run caches and collecting memory...");
                 _preloadedCharacters.Clear();
                 _permanentAssetCache.Clear();
@@ -1070,10 +1110,13 @@ public partial class STS2Bootstrapper : Node
                     GC.Collect(2, GCCollectionMode.Aggressive, true, true);
                 }
                 catch { }
+                Instance?.RecordMemoryStage("main_menu_after_cleanup");
             }
             else if (node is MegaCrit.Sts2.Core.Nodes.Screens.CharacterSelect.NCharacterSelectScreen)
             {
-                PrewarmMonsterIntents();
+                // This screen is instantiated while the main menu is created. Do not
+                // preload ~150 combat intent resources just for visiting the menu.
+                Instance?.RecordMemoryStage("character_select_created_on_demand");
             }
             else if (node is MegaCrit.Sts2.Core.Nodes.Screens.Map.NMapScreen mapScreen)
             {
