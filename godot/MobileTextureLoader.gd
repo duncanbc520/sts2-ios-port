@@ -10,7 +10,9 @@ func _get_resource_type(_path: String) -> String:
 	return "Texture2D"
 
 func _handles_type(type: StringName) -> bool:
-	return type == "Texture2D" or type == ""
+	# Imported PNG resources declare CompressedTexture2D in their .import files.
+	# Accepting only Texture2D lets Godot's desktop loader win for those requests.
+	return type == "CompressedTexture2D" or type == "Texture2D" or type == ""
 
 func _load(path: String, _original_path: String, _use_sub_threads: bool, _cache_mode: int) -> Variant:
 	# A preconverted resource is used when available. It has a .res suffix so the
