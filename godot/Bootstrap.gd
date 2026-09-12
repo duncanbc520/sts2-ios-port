@@ -2,9 +2,25 @@ extends Control
 
 @onready var status_label: Label = %StatusLabel
 @onready var progress_bar: ProgressBar = %ProgressBar
+var _mobile_texture_loader: ResourceFormatLoader
 
 func _ready() -> void:
+	register_mobile_texture_loader()
 	callable_init.call_deferred()
+
+func register_mobile_texture_loader() -> void:
+	if OS.get_name() != "iOS":
+		return
+	var loader_script := load("res://MobileTextureLoader.gd") as Script
+	if loader_script == null:
+		printerr("[STS2 Bootstrap] MobileTextureLoader.gd was not found.")
+		return
+	_mobile_texture_loader = loader_script.new() as ResourceFormatLoader
+	if _mobile_texture_loader == null:
+		printerr("[STS2 Bootstrap] Failed to instantiate mobile texture loader.")
+		return
+	ResourceLoader.add_resource_format_loader(_mobile_texture_loader, true)
+	printerr("[STS2 Bootstrap] Registered iOS mobile texture loader.")
 
 func callable_init() -> void:
 	await get_tree().process_frame
@@ -17,6 +33,7 @@ func callable_init() -> void:
 	DirAccess.make_dir_recursive_absolute("user://MegaCrit/SlayTheSpire2")
 	DirAccess.make_dir_recursive_absolute("user://MegaCrit/SlayTheSpire2/saves")
 	DirAccess.make_dir_recursive_absolute("user://MegaCrit/SlayTheSpire2/preferences")
+	mount_mobile_texture_pack()
 	
 	# Initialize / verify Spine GDExtension
 	if ClassDB.class_exists("SpineSprite"):
@@ -128,6 +145,9 @@ func show_missing_pck_instructions() -> void:
 		progress_bar.visible = false
 
 func initialize_fmod_banks() -> void:
+	if OS.get_name() == "iOS":
+		printerr("[STS2 Bootstrap] Skipping desktop FMOD bank preload on iOS to reduce memory pressure.")
+		return
 	if ClassDB.class_exists("FmodServer"):
 		var fmod_server = Engine.get_singleton("FmodServer")
 		if fmod_server:
@@ -144,3 +164,15 @@ func initialize_fmod_banks() -> void:
 					printerr("[STS2 Bootstrap] Loaded bank: ", b)
 				else:
 					printerr("[STS2 Bootstrap] Bank file not found: ", b)
+
+func mount_mobile_texture_pack() -> void:
+	var candidates := [
+		"user://SlayTheSpire2-Mobile.pck",
+		"res://SlayTheSpire2-Mobile.pck"
+	]
+	for pack_path in candidates:
+		if FileAccess.file_exists(pack_path):
+			if ProjectSettings.load_resource_pack(pack_path, true):
+				printerr("[STS2 Bootstrap] Loaded mobile texture cache: ", pack_path)
+				return
+			printerr("[STS2 Bootstrap] Failed to load mobile texture cache: ", pack_path)
