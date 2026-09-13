@@ -366,9 +366,15 @@ public sealed class TraceWeaverTests
             });
 
             var languageDropdownType = AddClassType(module, "MegaCrit.Sts2.Core.Nodes.Screens.Settings", "NLanguageDropdown");
-            AddMethod(languageDropdownType, "PopulateOptions", module.TypeSystem.Void);
+            var populateOptions = AddMethod(languageDropdownType, "PopulateOptions", module.TypeSystem.Void);
+            populateOptions.Body.GetILProcessor().InsertBefore(
+                populateOptions.Body.Instructions.Last(),
+                Instruction.Create(OpCodes.Nop));
             var languageItemType = AddClassType(module, "MegaCrit.Sts2.Core.Nodes.Screens.Settings", "NLanguageDropdownItem");
-            AddInstanceMethod(languageItemType, "Init", module.TypeSystem.Void, module.TypeSystem.String);
+            var init = AddInstanceMethod(languageItemType, "Init", module.TypeSystem.Void, module.TypeSystem.String);
+            init.Body.GetILProcessor().InsertBefore(
+                init.Body.Instructions.Last(),
+                Instruction.Create(OpCodes.Nop));
         }
 
         private static MethodDefinition AddInstanceMethod(
