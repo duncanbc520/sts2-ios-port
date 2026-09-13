@@ -60,10 +60,13 @@ public static class TraceWeaver
         // transform the staged DLL in place while leaving the root lib/sts2.dll untouched.
         var inputBytes = File.ReadAllBytes(inputFullPath);
         using var inputStream = new MemoryStream(inputBytes, writable: false);
+        using var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(Path.GetDirectoryName(inputFullPath)!);
         using var assembly = AssemblyDefinition.ReadAssembly(inputStream, new ReaderParameters
         {
             InMemory = true,
             ReadSymbols = false,
+            AssemblyResolver = resolver,
         });
 
         var executeDeferred = FindExecuteDeferred(assembly.MainModule);
