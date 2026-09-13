@@ -178,7 +178,8 @@ public static class TraceWeaver
                     $"Unexpected call shape for {site.DeclaringType}::{site.MethodName}(); expected a direct call with no arguments and a void return.");
             }
 
-            var definition = TryResolve(method);
+            var definition = FindType(module, site.DeclaringType)?.Methods.SingleOrDefault(candidate =>
+                candidate.MetadataToken == method.MetadataToken);
             if (definition is null
                 || !HasSignature(definition, site.DeclaringType, site.MethodName, "System.Void")
                 || !definition.IsStatic
@@ -303,7 +304,7 @@ public static class TraceWeaver
         instruction?.OpCode.Code == Code.Call
         && instruction.Operand is MethodReference method
         && HasSignature(method, LogType, "Info", "System.Void", "System.String", "System.Int32")
-        && TryResolve(method)?.MetadataToken == logInfo.MetadataToken;
+        && method.MetadataToken == logInfo.MetadataToken;
 
     private static bool HasSignature(
         MethodReference method,
@@ -319,22 +320,6 @@ public static class TraceWeaver
             && method.Parameters.Select(parameter => parameter.ParameterType.FullName)
                 .SequenceEqual(parameterTypes, StringComparer.Ordinal)
             && !method.HasGenericParameters;
-    }
-
-    private static MethodDefinition? TryResolve(MethodReference method)
-    {
-        try
-        {
-            return method.Resolve();
-        }
-        catch (AssemblyResolutionException)
-        {
-            return null;
-        }
-        catch (BadImageFormatException)
-        {
-            return null;
-        }
     }
 
     private static TypeDefinition? FindType(ModuleDefinition module, string fullName)
