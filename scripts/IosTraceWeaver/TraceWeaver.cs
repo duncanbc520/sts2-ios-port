@@ -420,12 +420,23 @@ public static class TraceWeaver
     {
         if (site.BoundaryOnly)
         {
-            return HasLogSequenceBefore(target.Entry!, site.BeforeMarker, logInfo)
+            return HasLogSequenceAtEntry(target.Method, site.BeforeMarker, logInfo)
                 && HasLogSequenceBefore(target.Exit!, site.AfterMarker, logInfo);
         }
 
         return HasLogSequenceBefore(target.Call!, site.BeforeMarker, logInfo)
             && HasLogSequenceAfter(target.Call!, site.AfterMarker, logInfo);
+    }
+
+    private static bool HasLogSequenceAtEntry(
+        MethodDefinition method,
+        string marker,
+        MethodDefinition logInfo)
+    {
+        var first = method.Body.Instructions.FirstOrDefault();
+        return IsMarkerInstruction(first, marker)
+            && IsLdcI4Two(first?.Next)
+            && IsLogInfoCall(first?.Next?.Next, logInfo);
     }
 
     private static MethodReference FindStringConcat(ModuleDefinition module)
