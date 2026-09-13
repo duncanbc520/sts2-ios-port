@@ -5,6 +5,7 @@ const PORT_LOG_PATH := "user://sts2_port.log"
 var _converted_count := 0
 var _cache_hit_count := 0
 var _cache_miss_count := 0
+var _missing_texture: Texture2D
 
 func _get_recognized_extensions() -> PackedStringArray:
 	return PackedStringArray(["ctex"])
@@ -14,8 +15,8 @@ func _get_resource_type(_path: String) -> String:
 
 func _handles_type(type: StringName) -> bool:
 	# Imported PNG resources declare CompressedTexture2D in their .import files.
-	# Accepting only Texture2D lets Godot's desktop loader win for those requests.
-	return type == "CompressedTexture2D" or type == "Texture2D" or type == ""
+	# AssetCache loads them as Resource, so that hint must route here as well.
+	return type == "Resource" or type == "CompressedTexture2D" or type == "Texture2D" or type == ""
 
 func _load(path: String, _original_path: String, _use_sub_threads: bool, _cache_mode: int) -> Variant:
 	# A preconverted resource is used when available. It has a .res suffix so the
@@ -31,15 +32,18 @@ func _load(path: String, _original_path: String, _use_sub_threads: bool, _cache_
 				_log("cache hits=%d misses=%d latest=%s" % [_cache_hit_count, _cache_miss_count, path])
 			return cached
 		_log("ERROR cached resource is not Texture2D: " + cached_path)
+		if OS.get_name() == "iOS":
+			return _get_missing_texture()
 		return ERR_FILE_CORRUPT
 
 	_cache_miss_count += 1
 	_log("ERROR cache miss=%d path=%s" % [_cache_miss_count, path])
 	# Loading a desktop BPTC/DXT texture on iOS expands it to RGBA8 and can push
-	# this game beyond the device's Jetsam high-water limit. A missing cache entry
-	# is therefore a hard error on iOS instead of an unsafe on-demand conversion.
+	# this game beyond the device's Jetsam high-water limit. ResourceLoader tries
+	# later loaders after an error, so return one shared 1x1 texture here instead
+	# of allowing the built-in loader to decode the desktop source.
 	if OS.get_name() == "iOS":
-		return ERR_FILE_NOT_FOUND
+		return _get_missing_texture()
 
 	# Desktop-only fallback used by local diagnostics.
 	var source := CompressedTexture2D.new()
@@ -71,6 +75,13 @@ func get_stats() -> Dictionary:
 		"cache_misses": _cache_miss_count,
 		"desktop_conversions": _converted_count,
 	}
+
+func _get_missing_texture() -> Texture2D:
+	if _missing_texture == null:
+		var image := Image.create(1, 1, false, Image.FORMAT_RGBA8)
+		image.fill(Color(0, 0, 0, 0))
+		_missing_texture = ImageTexture.create_from_image(image)
+	return _missing_texture
 
 func _log(message: String) -> void:
 	var line := "[MobileTextureLoader] " + message
