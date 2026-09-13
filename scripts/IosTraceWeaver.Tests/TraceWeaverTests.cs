@@ -83,6 +83,26 @@ public sealed class TraceWeaverTests
         Assert.False(File.Exists(outputPath));
     }
 
+    [Fact]
+    public void AssetTraceWeavesPathBoundariesAndSecondPassIsAByteNoOp()
+    {
+        using var fixture = Fixture.Create(assetTraceFixture: true);
+        var inputPath = fixture.Path("input.dll");
+        var outputPath = fixture.Path("output.dll");
+        fixture.Write(inputPath);
+
+        var first = TraceWeaver.WeaveAssetTrace(inputPath, outputPath);
+        var firstBytes = File.ReadAllBytes(outputPath);
+        var second = TraceWeaver.WeaveAssetTrace(outputPath, outputPath);
+        var secondBytes = File.ReadAllBytes(outputPath);
+
+        Assert.True(first.Changed);
+        Assert.Equal(20, first.MarkerCount);
+        Assert.False(second.Changed);
+        Assert.Equal(firstBytes, secondBytes);
+        Assert.Equal(20, ReadAssetMarkers(outputPath).Count);
+    }
+
     private static IReadOnlyList<string> ReadMarkers(string path)
     {
         using var assembly = AssemblyDefinition.ReadAssembly(path);
@@ -95,6 +115,32 @@ public sealed class TraceWeaverTests
             .Where(value => value is not null && value.StartsWith("PHYS stage=", StringComparison.Ordinal))
             .Cast<string>()
             .ToArray();
+    }
+
+    private static IReadOnlyList<string> ReadAssetMarkers(string path)
+    {
+        using var assembly = AssemblyDefinition.ReadAssembly(path);
+        return AllTypes(assembly.MainModule.Types)
+            .SelectMany(type => type.Methods)
+            .Where(method => method.HasBody)
+            .SelectMany(method => method.Body.Instructions)
+            .Where(instruction => instruction.OpCode.Code == Code.Ldstr)
+            .Select(instruction => instruction.Operand as string)
+            .Where(value => value is not null && value.StartsWith("PHYS stage=", StringComparison.Ordinal))
+            .Cast<string>()
+            .ToArray();
+    }
+
+    private static IEnumerable<TypeDefinition> AllTypes(IEnumerable<TypeDefinition> types)
+    {
+        foreach (var type in types)
+        {
+            yield return type;
+            foreach (var nested in AllTypes(type.NestedTypes))
+            {
+                yield return nested;
+            }
+        }
     }
 
     private sealed class Fixture : IDisposable
@@ -110,7 +156,8 @@ public sealed class TraceWeaverTests
         public static Fixture Create(
             bool orphanMarker = false,
             bool duplicateAtlasCall = false,
-            bool wrongLogSignature = false)
+            bool wrongLogSignature = false,
+            bool assetTraceFixture = false)
         {
             var assembly = AssemblyDefinition.CreateAssembly(
                 new AssemblyNameDefinition("sts2", new Version(1, 0, 0, 0)),
@@ -154,6 +201,10 @@ public sealed class TraceWeaverTests
             }
 
             il.Append(il.Create(OpCodes.Ret));
+            if (assetTraceFixture)
+            {
+                AddAssetTraceFixture(module);
+            }
             var directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "IosTraceWeaverTests", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(directory);
             return new Fixture(assembly, directory);
@@ -188,6 +239,162 @@ public sealed class TraceWeaverTests
                 module.TypeSystem.Object);
             module.Types.Add(type);
             return type;
+        }
+
+        private static TypeDefinition AddClassType(ModuleDefinition module, string @namespace, string name)
+        {
+            var type = new TypeDefinition(
+                @namespace,
+                name,
+                TypeAttributes.Public | TypeAttributes.Class,
+                module.TypeSystem.Object);
+            module.Types.Add(type);
+            return type;
+        }
+
+        private static void AddAssetTraceFixture(ModuleDefinition module)
+        {
+            var conditionalFormatterType = AddClassType(module, "SmartFormat.Extensions", "ConditionalFormatter");
+            var conditionalFormatterCtor = AddInstanceMethod(conditionalFormatterType, ".ctor", module.TypeSystem.Void);
+            var initializationType = module.GetType("MegaCrit.Sts2.Core.Helpers.OneTimeInitialization")!;
+            var executeDeferred = initializationType.Methods.Single(method => method.Name == "ExecuteDeferred");
+            var executeIl = executeDeferred.Body.GetILProcessor();
+            var executeReturn = executeDeferred.Body.Instructions.Last();
+            executeIl.InsertBefore(executeReturn, executeIl.Create(OpCodes.Newobj, conditionalFormatterCtor));
+            executeIl.InsertBefore(executeReturn, executeIl.Create(OpCodes.Pop));
+
+            var loaderType = AddStaticType(module, "Godot", "ResourceLoader");
+            var load = AddMethod(loaderType, "Load", module.TypeSystem.Object, module.TypeSystem.String);
+            var threadedRequest = AddMethod(
+                loaderType,
+                "LoadThreadedRequest",
+                module.TypeSystem.Int32,
+                module.TypeSystem.String,
+                module.TypeSystem.String,
+                module.TypeSystem.Boolean,
+                module.TypeSystem.Int64);
+            var threadedGet = AddMethod(loaderType, "LoadThreadedGet", module.TypeSystem.Object, module.TypeSystem.String);
+
+            var assetCacheType = AddStaticType(module, "MegaCrit.Sts2.Core.Assets", "AssetCache");
+            var assetLoad = AddInstanceMethod(assetCacheType, "LoadAsset", module.TypeSystem.Object, module.TypeSystem.String);
+            SetBody(assetLoad, module, il =>
+            {
+                il.Append(il.Create(OpCodes.Ldarg_1));
+                il.Append(il.Create(OpCodes.Call, load));
+                il.Append(il.Create(OpCodes.Ret));
+            });
+
+            var loadingSessionType = AddStaticType(module, "MegaCrit.Sts2.Core.Assets", "AssetLoadingSession");
+            var process = AddInstanceMethod(loadingSessionType, "ProcessLoadingQueue", module.TypeSystem.Void);
+            AddLocal(process, module.TypeSystem.String);
+            SetBody(process, module, il =>
+            {
+                il.Append(il.Create(OpCodes.Ldstr, "res://threaded.ctex"));
+                il.Append(il.Create(OpCodes.Stloc_0));
+                il.Append(il.Create(OpCodes.Ldloc_0));
+                il.Append(il.Create(OpCodes.Ldstr, ""));
+                il.Append(il.Create(OpCodes.Ldc_I4_0));
+                il.Append(il.Create(OpCodes.Ldc_I4_1));
+                il.Append(il.Create(OpCodes.Conv_I8));
+                il.Append(il.Create(OpCodes.Call, threadedRequest));
+                il.Append(il.Create(OpCodes.Pop));
+                il.Append(il.Create(OpCodes.Ret));
+            });
+
+            var finalize = AddInstanceMethod(loadingSessionType, "FinalizeLoading", module.TypeSystem.Void);
+            AddLocal(finalize, module.TypeSystem.String);
+            SetBody(finalize, module, il =>
+            {
+                il.Append(il.Create(OpCodes.Ldstr, "res://finalize.ctex"));
+                il.Append(il.Create(OpCodes.Stloc_0));
+                il.Append(il.Create(OpCodes.Ldloc_0));
+                il.Append(il.Create(OpCodes.Call, threadedGet));
+                il.Append(il.Create(OpCodes.Pop));
+                il.Append(il.Create(OpCodes.Ret));
+            });
+
+            var check = AddInstanceMethod(loadingSessionType, "CheckLoadingStatus", module.TypeSystem.Void);
+            AddLocal(check, module.TypeSystem.String);
+            AddLocal(check, module.TypeSystem.String);
+            AddLocal(check, module.TypeSystem.String);
+            SetBody(check, module, il =>
+            {
+                il.Append(il.Create(OpCodes.Ldstr, "res://fallback.ctex"));
+                il.Append(il.Create(OpCodes.Stloc_2));
+                il.Append(il.Create(OpCodes.Ldloc_2));
+                il.Append(il.Create(OpCodes.Call, load));
+                il.Append(il.Create(OpCodes.Pop));
+                il.Append(il.Create(OpCodes.Ret));
+            });
+
+            var fontManagerType = AddStaticType(module, "MegaCrit.Sts2.Core.Localization.Fonts", "FontManager");
+            var fontLoad = AddMethod(fontManagerType, "GetFontForLanguage", module.TypeSystem.Object, module.TypeSystem.String);
+            AddLocal(fontLoad, module.TypeSystem.String);
+            AddLocal(fontLoad, module.TypeSystem.String);
+            SetBody(fontLoad, module, il =>
+            {
+                il.Append(il.Create(OpCodes.Ldstr, "res://fonts/test.fontdata"));
+                il.Append(il.Create(OpCodes.Stloc_1));
+                il.Append(il.Create(OpCodes.Ldloc_1));
+                il.Append(il.Create(OpCodes.Call, load));
+                il.Append(il.Create(OpCodes.Pop));
+                il.Append(il.Create(OpCodes.Ldnull));
+                il.Append(il.Create(OpCodes.Ret));
+            });
+
+            var preloadManagerType = AddStaticType(module, "MegaCrit.Sts2.Core.Assets", "PreloadManager");
+            var commonAndMainMenuAssets = AddMethod(
+                preloadManagerType,
+                "LoadCommonAndMainMenuAssets",
+                module.TypeSystem.Object);
+            var taskAwaiterType = AddStaticType(module, "System.Runtime.CompilerServices", "TaskAwaiter");
+            var taskAwaiterGetResult = AddMethod(taskAwaiterType, "GetResult", module.TypeSystem.Void);
+            var nGameType = AddClassType(module, "MegaCrit.Sts2.Core.Nodes", "NGame");
+            var stateMachineType = new TypeDefinition(
+                "",
+                "<LoadDeferredStartupAssetsAsync>d__136",
+                TypeAttributes.NestedPrivate | TypeAttributes.Class,
+                module.TypeSystem.Object);
+            nGameType.NestedTypes.Add(stateMachineType);
+            var moveNext = AddInstanceMethod(stateMachineType, "MoveNext", module.TypeSystem.Void);
+            SetBody(moveNext, module, il =>
+            {
+                il.Append(il.Create(OpCodes.Call, commonAndMainMenuAssets));
+                il.Append(il.Create(OpCodes.Pop));
+                il.Append(il.Create(OpCodes.Call, taskAwaiterGetResult));
+                il.Append(il.Create(OpCodes.Ret));
+            });
+
+            var languageDropdownType = AddClassType(module, "MegaCrit.Sts2.Core.Nodes.Screens.Settings", "NLanguageDropdown");
+            AddMethod(languageDropdownType, "PopulateOptions", module.TypeSystem.Void);
+            var languageItemType = AddClassType(module, "MegaCrit.Sts2.Core.Nodes.Screens.Settings", "NLanguageDropdownItem");
+            AddInstanceMethod(languageItemType, "Init", module.TypeSystem.Void, module.TypeSystem.String);
+        }
+
+        private static MethodDefinition AddInstanceMethod(
+            TypeDefinition type,
+            string name,
+            TypeReference returnType,
+            params TypeReference[] parameterTypes)
+        {
+            return AddMethod(
+                type,
+                name,
+                returnType,
+                MethodAttributes.Public | MethodAttributes.HideBySig,
+                parameterTypes);
+        }
+
+        private static void AddLocal(MethodDefinition method, TypeReference type) =>
+            method.Body.Variables.Add(new VariableDefinition(type));
+
+        private static void SetBody(
+            MethodDefinition method,
+            ModuleDefinition module,
+            Action<ILProcessor> append)
+        {
+            method.Body.Instructions.Clear();
+            append(method.Body.GetILProcessor());
         }
 
         private static MethodDefinition AddMethod(

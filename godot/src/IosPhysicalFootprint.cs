@@ -22,6 +22,144 @@ public static class IosPhysicalFootprint
     // throwing an exception on every sampling tick after the first failed attempt.
     private static int _bindingState;
 
+    private static readonly object DiagnosticSamplerLock = new();
+    private static Timer? _diagnosticSampler;
+    private static string? _diagnosticSamplerLogPath;
+    private static DateTime _diagnosticSamplerDeadlineUtc;
+    private static int _diagnosticSampleSequence;
+
+    /// <summary>
+    /// Starts a bounded timer that samples the Darwin physical footprint from a
+    /// worker thread. The timer intentionally performs no Godot or renderer calls,
+    /// so it continues sampling while the main thread is blocked in startup work.
+    /// </summary>
+    public static void StartDiagnosticSampling(
+        string logPath,
+        int intervalMilliseconds = 50,
+        int durationMilliseconds = 40000)
+    {
+        if (!OperatingSystem.IsIOS()
+            || string.IsNullOrWhiteSpace(logPath)
+            || intervalMilliseconds <= 0
+            || durationMilliseconds <= 0)
+        {
+            return;
+        }
+
+        lock (DiagnosticSamplerLock)
+        {
+            if (_diagnosticSampler != null)
+            {
+                return;
+            }
+
+            try
+            {
+                var directory = System.IO.Path.GetDirectoryName(logPath);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    System.IO.Directory.CreateDirectory(directory);
+                }
+
+                System.IO.File.AppendAllText(
+                    logPath,
+                    $"\n=== PHYS timer started at {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff} UTC interval={intervalMilliseconds}ms duration={durationMilliseconds}ms ===\n");
+
+                _diagnosticSamplerLogPath = logPath;
+                _diagnosticSamplerDeadlineUtc = DateTime.UtcNow.AddMilliseconds(durationMilliseconds);
+                _diagnosticSampleSequence = 0;
+                _diagnosticSampler = new Timer(
+                    static _ => SampleDiagnosticFootprint(),
+                    state: null,
+                    dueTime: TimeSpan.Zero,
+                    period: TimeSpan.FromMilliseconds(intervalMilliseconds));
+            }
+            catch
+            {
+                _diagnosticSampler = null;
+                _diagnosticSamplerLogPath = null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stops the bounded diagnostic timer, if one is active.
+    /// </summary>
+    public static void StopDiagnosticSampling()
+    {
+        Timer? sampler;
+        lock (DiagnosticSamplerLock)
+        {
+            sampler = _diagnosticSampler;
+            _diagnosticSampler = null;
+            _diagnosticSamplerLogPath = null;
+        }
+
+        sampler?.Dispose();
+    }
+
+    private static void SampleDiagnosticFootprint()
+    {
+        string? logPath;
+        int sequence;
+        lock (DiagnosticSamplerLock)
+        {
+            if (_diagnosticSampler == null)
+            {
+                return;
+            }
+
+            if (DateTime.UtcNow >= _diagnosticSamplerDeadlineUtc)
+            {
+                logPath = null;
+                sequence = 0;
+            }
+            else
+            {
+                logPath = _diagnosticSamplerLogPath;
+                sequence = ++_diagnosticSampleSequence;
+            }
+        }
+
+        if (logPath == null)
+        {
+            StopDiagnosticSampling();
+            return;
+        }
+
+        if (!TryGetPhysicalFootprintBytes(out long bytes))
+        {
+            return;
+        }
+
+        var line = $"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss.fff}] [PHYS-TIMER] "
+            + $"pid={Environment.ProcessId} sample={sequence} "
+            + $"thread={Environment.CurrentManagedThreadId} "
+            + $"PhysicalFootprintBytes={bytes} PhysicalFootprint={bytes / 1048576.0:F1}MB";
+        try
+        {
+            System.IO.File.AppendAllText(logPath, line + Environment.NewLine);
+        }
+        catch
+        {
+            // Diagnostic sampling must never affect the game if its log file is unavailable.
+        }
+
+        lock (DiagnosticSamplerLock)
+        {
+            if (_diagnosticSampler != null && DateTime.UtcNow >= _diagnosticSamplerDeadlineUtc)
+            {
+                // Dispose outside the lock to avoid re-entering Timer cleanup here.
+                logPath = null;
+            }
+        }
+
+        if (logPath == null)
+        {
+            StopDiagnosticSampling();
+        }
+    }
+
     /// <summary>
     /// Attempts to read this process's physical footprint in bytes.
     /// </summary>

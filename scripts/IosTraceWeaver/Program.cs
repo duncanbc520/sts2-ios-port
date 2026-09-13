@@ -9,10 +9,12 @@ internal static class Program
         try
         {
             var options = WeaverOptions.Parse(args);
-            var result = TraceWeaver.Weave(options.InputPath, options.OutputPath);
+            var result = options.AssetTrace
+                ? TraceWeaver.WeaveAssetTrace(options.InputPath, options.OutputPath)
+                : TraceWeaver.Weave(options.InputPath, options.OutputPath);
             Console.WriteLine(result.Changed
-                ? $"Wove {result.MarkerCount} physical-footprint markers into {options.OutputPath}."
-                : $"Physical-footprint markers already present in {options.InputPath}; no IL changes made.");
+                ? $"Wove {result.MarkerCount} {(options.AssetTrace ? "asset-trace" : "physical-footprint")} markers into {options.OutputPath}."
+                : $"{(options.AssetTrace ? "Asset-trace" : "Physical-footprint")} markers already present in {options.InputPath}; no IL changes made.");
             return 0;
         }
         catch (TraceWeaverException ex)
@@ -28,7 +30,7 @@ internal static class Program
     }
 }
 
-internal sealed record WeaverOptions(string InputPath, string OutputPath)
+internal sealed record WeaverOptions(string InputPath, string OutputPath, bool AssetTrace)
 {
     public static WeaverOptions Parse(string[] args)
     {
@@ -39,6 +41,7 @@ internal sealed record WeaverOptions(string InputPath, string OutputPath)
 
         string? inputPath = null;
         string? outputPath = null;
+        var assetTrace = false;
         for (var index = 0; index < args.Length; index++)
         {
             switch (args[index])
@@ -48,6 +51,9 @@ internal sealed record WeaverOptions(string InputPath, string OutputPath)
                     break;
                 case "--output":
                     outputPath = ReadValue(args, ref index, "--output");
+                    break;
+                case "--asset-trace":
+                    assetTrace = true;
                     break;
                 case "--help":
                 case "-h":
@@ -62,7 +68,7 @@ internal sealed record WeaverOptions(string InputPath, string OutputPath)
             throw new TraceWeaverException($"Both --input and --output are required.\n{Usage()}");
         }
 
-        return new WeaverOptions(inputPath, outputPath);
+        return new WeaverOptions(inputPath, outputPath, assetTrace);
     }
 
     private static string ReadValue(string[] args, ref int index, string option)
@@ -77,5 +83,5 @@ internal sealed record WeaverOptions(string InputPath, string OutputPath)
     }
 
     private static string Usage() =>
-        "Usage: IosTraceWeaver --input <sts2.dll> --output <sts2.dll>";
+        "Usage: IosTraceWeaver --input <sts2.dll> --output <sts2.dll> [--asset-trace]";
 }

@@ -1,7 +1,7 @@
 extends SceneTree
 
 const MANIFEST_PACK_PATH := "res://sts2_mobile_cache_manifest.json"
-const CACHE_SCHEMA := 2
+const CACHE_SCHEMA := 3
 
 func _init() -> void:
 	var args := OS.get_cmdline_user_args()
@@ -59,9 +59,21 @@ func _init() -> void:
 				printerr("decompress failed (", decompress_error, "): ", path)
 				failures += 1
 				continue
-		var compress_error: Error = image.compress(Image.COMPRESS_ASTC, Image.COMPRESS_SOURCE_GENERIC, 1)
+		# Godot labels ASTC output as HDR when the source is a half/float image.
+		# The resulting format is not the requested standard ASTC 8x8 payload:
+		# for card_frame_sdf.exr it was format 38 with a 4x4-sized payload, while
+		# the iOS renderer expects format 37 and an 8x8-sized payload. Mobile UI
+		# textures do not need HDR precision, so normalize HDR sources to RGBA8
+		# before compression.
+		if _is_hdr_format(image.get_format()):
+			image.convert(Image.FORMAT_RGBA8)
+		var compress_error: Error = image.compress(Image.COMPRESS_ASTC, Image.COMPRESS_SOURCE_GENERIC, Image.ASTC_FORMAT_8x8)
 		if compress_error != OK:
 			printerr("ASTC compress failed (", compress_error, "): ", path)
+			failures += 1
+			continue
+		if image.get_format() != Image.FORMAT_ASTC_8x8:
+			printerr("ASTC output format mismatch (", image.get_format(), "): ", path)
 			failures += 1
 			continue
 		var mobile_texture := ImageTexture.create_from_image(image)
@@ -86,7 +98,7 @@ func _init() -> void:
 	if failures == 0 and converted == texture_paths.size():
 		var manifest := {
 			"schema": CACHE_SCHEMA,
-			"cache_build_id": "astc8x8-v2-" + source_pck_sha256.left(12).to_lower(),
+			"cache_build_id": "astc8x8-v3-" + source_pck_sha256.left(12).to_lower(),
 			"source_pck_bytes": source_pck_bytes,
 			"source_pck_sha256": source_pck_sha256,
 			"game_version": "v0.111.0",
@@ -131,3 +143,13 @@ func _collect_texture_paths(path: String, result: Array[String]) -> void:
 			result.append(path.path_join(file_name))
 	for subdir in dir.get_directories():
 		_collect_texture_paths(path.path_join(subdir), result)
+
+func _is_hdr_format(format: int) -> bool:
+	return format == Image.FORMAT_RF \
+		or format == Image.FORMAT_RGF \
+		or format == Image.FORMAT_RGBF \
+		or format == Image.FORMAT_RGBAF \
+		or format == Image.FORMAT_RH \
+		or format == Image.FORMAT_RGH \
+		or format == Image.FORMAT_RGBH \
+		or format == Image.FORMAT_RGBAH

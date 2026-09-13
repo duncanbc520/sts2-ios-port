@@ -145,6 +145,10 @@ jobs:
           dotnet run --project scripts/IosTraceWeaver/IosTraceWeaver.csproj -c Release --no-restore -- \
             --input godot/lib/sts2.dll \
             --output godot/lib/sts2.dll
+          dotnet run --project scripts/IosTraceWeaver/IosTraceWeaver.csproj -c Release --no-restore -- \
+            --input godot/lib/sts2.dll \
+            --output godot/lib/sts2.dll \
+            --asset-trace
 
       - name: Compile STS2iOS Assembly
         run: |

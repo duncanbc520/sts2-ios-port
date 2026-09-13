@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 
@@ -45,6 +46,86 @@ public static class TraceWeaver
             "before_prewarm_jit",
             "after_prewarm_jit",
             IsPrivate: true),
+    };
+
+    private static readonly AssetTraceSite[] AssetTraceSites =
+    {
+        new(
+            "AssetCacheLoad",
+            "MegaCrit.Sts2.Core.Assets.AssetCache",
+            "LoadAsset",
+            "Load",
+            "asset_load",
+            AssetTracePathKind.Argument1),
+        new(
+            "ThreadedRequest",
+            "MegaCrit.Sts2.Core.Assets.AssetLoadingSession",
+            "ProcessLoadingQueue",
+            "LoadThreadedRequest",
+            "threaded_request",
+            AssetTracePathKind.Local0),
+        new(
+            "ThreadedGet",
+            "MegaCrit.Sts2.Core.Assets.AssetLoadingSession",
+            "FinalizeLoading",
+            "LoadThreadedGet",
+            "threaded_get",
+            AssetTracePathKind.Local0),
+        new(
+            "ThreadedFallback",
+            "MegaCrit.Sts2.Core.Assets.AssetLoadingSession",
+            "CheckLoadingStatus",
+            "Load",
+            "threaded_fallback",
+            AssetTracePathKind.Local2),
+        new(
+            "FontLoad",
+            "MegaCrit.Sts2.Core.Localization.Fonts.FontManager",
+            "GetFontForLanguage",
+            "Load",
+            "font_load",
+            AssetTracePathKind.Local1),
+    };
+
+    private static readonly StaticTraceSite[] StaticTraceSites =
+    {
+        new(
+            "ConditionalFormatter",
+            "MegaCrit.Sts2.Core.Helpers.OneTimeInitialization",
+            "ExecuteDeferred",
+            "SmartFormat.Extensions.ConditionalFormatter",
+            ".ctor",
+            "conditional_formatter"),
+        new(
+            "LoadCommonAndMainMenuAssets",
+            "MegaCrit.Sts2.Core.Nodes.NGame/<LoadDeferredStartupAssetsAsync>d__136",
+            "MoveNext",
+            "MegaCrit.Sts2.Core.Assets.PreloadManager",
+            "LoadCommonAndMainMenuAssets",
+            "load_common_main_menu"),
+        new(
+            "LoadCommonAndMainMenuComplete",
+            "MegaCrit.Sts2.Core.Nodes.NGame/<LoadDeferredStartupAssetsAsync>d__136",
+            "MoveNext",
+            "System.Runtime.CompilerServices.TaskAwaiter",
+            "GetResult",
+            "load_common_main_menu_complete"),
+        new(
+            "LanguageDropdownPopulate",
+            "MegaCrit.Sts2.Core.Nodes.Screens.Settings.NLanguageDropdown",
+            "PopulateOptions",
+            null,
+            null,
+            "language_dropdown_populate",
+            BoundaryOnly: true),
+        new(
+            "LanguageDropdownItemInit",
+            "MegaCrit.Sts2.Core.Nodes.Screens.Settings.NLanguageDropdownItem",
+            "Init",
+            null,
+            null,
+            "language_dropdown_item_init",
+            BoundaryOnly: true),
     };
 
     public static WeaveResult Weave(string inputPath, string outputPath)
@@ -94,6 +175,389 @@ public static class TraceWeaver
         WriteAtomically(outputFullPath, outputStream.ToArray());
         return new WeaveResult(Changed: true, MarkerCount: markerCount);
     }
+
+    /// <summary>
+    /// Adds dynamic path-bearing load boundaries to the diagnostic assembly only.
+    /// This is intentionally a separate pass so normal production builds retain the
+    /// existing six-stage footprint markers and no per-asset logging overhead.
+    /// </summary>
+    public static WeaveResult WeaveAssetTrace(string inputPath, string outputPath)
+    {
+        var inputFullPath = GetRequiredFullPath(inputPath, "input");
+        var outputFullPath = GetRequiredFullPath(outputPath, "output");
+        if (!File.Exists(inputFullPath))
+        {
+            throw new TraceWeaverException($"Input assembly does not exist: {inputFullPath}");
+        }
+
+        var inputBytes = File.ReadAllBytes(inputFullPath);
+        using var inputStream = new MemoryStream(inputBytes, writable: false);
+        using var resolver = new DefaultAssemblyResolver();
+        resolver.AddSearchDirectory(Path.GetDirectoryName(inputFullPath)!);
+        using var assembly = AssemblyDefinition.ReadAssembly(inputStream, new ReaderParameters
+        {
+            InMemory = true,
+            ReadSymbols = false,
+            AssemblyResolver = resolver,
+        });
+
+        var logInfo = FindLogInfo(assembly.MainModule);
+        var assetSites = ValidateAssetTraceSites(assembly.MainModule);
+        var staticSites = ValidateStaticTraceSites(assembly.MainModule);
+        var markerCount = (AssetTraceSites.Length + StaticTraceSites.Length) * 2;
+        if (HasAnyDiagnosticTraceMarker(assetSites, staticSites))
+        {
+            ValidateCompleteAssetTrace(assetSites, staticSites, logInfo);
+            CopyIfNeeded(inputBytes, inputFullPath, outputFullPath);
+            return new WeaveResult(Changed: false, MarkerCount: markerCount);
+        }
+
+        var concat = FindStringConcat(assembly.MainModule);
+        foreach (var site in AssetTraceSites)
+        {
+            var target = assetSites[site.Name];
+            InsertDynamicLog(target.Processor, target.PathLoad, site.BeforeMarker, site.PathKind, concat, logInfo, before: true);
+            InsertDynamicLog(target.Processor, target.Call, site.AfterMarker, site.PathKind, concat, logInfo, before: false);
+        }
+        foreach (var site in StaticTraceSites)
+        {
+            var target = staticSites[site.Name];
+            InsertStaticTrace(target, site, logInfo);
+        }
+
+        using var outputStream = new MemoryStream();
+        assembly.Write(outputStream, new WriterParameters { WriteSymbols = false });
+        WriteAtomically(outputFullPath, outputStream.ToArray());
+        return new WeaveResult(Changed: true, MarkerCount: markerCount);
+    }
+
+    private static Dictionary<string, AssetTraceTarget> ValidateAssetTraceSites(ModuleDefinition module)
+    {
+        var targets = new Dictionary<string, AssetTraceTarget>(StringComparer.Ordinal);
+        foreach (var site in AssetTraceSites)
+        {
+            var type = FindType(module, site.DeclaringType);
+            if (type is null)
+            {
+                throw new TraceWeaverException($"Required asset-trace type is missing: {site.DeclaringType}");
+            }
+
+            var methods = type.Methods.Where(method => method.Name == site.MethodName).ToArray();
+            if (methods.Length != 1 || !methods[0].HasBody)
+            {
+                throw new TraceWeaverException(
+                    $"Expected exactly one body-bearing {site.DeclaringType}::{site.MethodName}() method; found {methods.Length}.");
+            }
+
+            var method = methods[0];
+            var calls = method.Body.Instructions
+                .Where(instruction => instruction.Operand is MethodReference reference
+                    && reference.Name == site.LoaderMethodName
+                    && reference.DeclaringType.FullName == "Godot.ResourceLoader")
+                .ToArray();
+            if (calls.Length != 1 || calls[0].OpCode.Code != Code.Call)
+            {
+                throw new TraceWeaverException(
+                    $"Expected exactly one direct Godot.ResourceLoader::{site.LoaderMethodName} call in {method.FullName}; found {calls.Length}.");
+            }
+
+            var call = calls[0];
+            var pathLoad = FindPathLoad(method, call, site.PathKind);
+            targets.Add(site.Name, new AssetTraceTarget(method, method.Body.GetILProcessor(), call, pathLoad));
+        }
+
+        return targets;
+    }
+
+    private static Instruction FindPathLoad(MethodDefinition method, Instruction call, AssetTracePathKind pathKind)
+    {
+        var instruction = call.Previous;
+        for (var distance = 0; instruction is not null && distance < 12; distance++, instruction = instruction.Previous)
+        {
+            if (IsPathLoad(instruction, pathKind))
+            {
+                return instruction;
+            }
+        }
+
+        throw new TraceWeaverException(
+            $"Could not find the expected path load for {method.FullName} before {call.Operand}.");
+    }
+
+    private static Dictionary<string, StaticTraceTarget> ValidateStaticTraceSites(ModuleDefinition module)
+    {
+        var targets = new Dictionary<string, StaticTraceTarget>(StringComparer.Ordinal);
+        foreach (var site in StaticTraceSites)
+        {
+            var type = FindType(module, site.DeclaringType);
+            if (type is null)
+            {
+                throw new TraceWeaverException($"Required diagnostic-trace type is missing: {site.DeclaringType}");
+            }
+
+            var methods = type.Methods.Where(method => method.Name == site.MethodName).ToArray();
+            if (methods.Length != 1 || !methods[0].HasBody)
+            {
+                throw new TraceWeaverException(
+                    $"Expected exactly one body-bearing {site.DeclaringType}::{site.MethodName}() method; found {methods.Length}.");
+            }
+
+            var method = methods[0];
+            if (site.BoundaryOnly)
+            {
+                if (method.Body.Instructions.Count == 0)
+                {
+                    throw new TraceWeaverException($"Diagnostic boundary has no instructions: {method.FullName}");
+                }
+                var returns = method.Body.Instructions
+                    .Where(instruction => instruction.OpCode.Code == Code.Ret)
+                    .ToArray();
+                if (returns.Length != 1)
+                {
+                    throw new TraceWeaverException(
+                        $"Expected exactly one return in diagnostic boundary {method.FullName}; found {returns.Length}.");
+                }
+
+                targets.Add(site.Name, new StaticTraceTarget(
+                    method,
+                    method.Body.GetILProcessor(),
+                    Call: null,
+                    Entry: method.Body.Instructions.First(),
+                    Exit: returns[0]));
+                continue;
+            }
+
+            var calls = method.Body.Instructions
+                .Where(instruction => instruction.Operand is MethodReference reference
+                    && reference.Name == site.TargetMethodName
+                    && reference.DeclaringType.FullName == site.TargetDeclaringType)
+                .ToArray();
+            if (calls.Length != 1
+                || (calls[0].OpCode.Code != Code.Call && calls[0].OpCode.Code != Code.Newobj))
+            {
+                throw new TraceWeaverException(
+                    $"Expected exactly one direct {site.TargetDeclaringType}::{site.TargetMethodName} call in {method.FullName}; found {calls.Length}.");
+            }
+
+            targets.Add(site.Name, new StaticTraceTarget(
+                method,
+                method.Body.GetILProcessor(),
+                calls[0],
+                Entry: null,
+                Exit: null));
+        }
+
+        return targets;
+    }
+
+    private static bool HasAnyDiagnosticTraceMarker(
+        IReadOnlyDictionary<string, AssetTraceTarget> assetTargets,
+        IReadOnlyDictionary<string, StaticTraceTarget> staticTargets)
+    {
+        var markers = AssetTraceSites
+            .SelectMany(site => new[] { site.BeforeMarker, site.AfterMarker })
+            .Concat(StaticTraceSites.SelectMany(site => new[] { site.BeforeMarker, site.AfterMarker }))
+            .ToHashSet(StringComparer.Ordinal);
+        return assetTargets.Values.Any(target => target.Method.Body.Instructions.Any(instruction =>
+            instruction.OpCode.Code == Code.Ldstr
+            && instruction.Operand is string marker
+            && markers.Contains(marker)))
+            || staticTargets.Values.Any(target => target.Method.Body.Instructions.Any(instruction =>
+            instruction.OpCode.Code == Code.Ldstr
+            && instruction.Operand is string marker
+            && markers.Contains(marker)));
+    }
+
+    private static void ValidateCompleteAssetTrace(
+        IReadOnlyDictionary<string, AssetTraceTarget> assetTargets,
+        IReadOnlyDictionary<string, StaticTraceTarget> staticTargets,
+        MethodDefinition logInfo)
+    {
+        foreach (var site in AssetTraceSites)
+        {
+            var target = assetTargets[site.Name];
+            var beforeCount = target.Method.Body.Instructions.Count(instruction =>
+                IsMarkerInstruction(instruction, site.BeforeMarker));
+            var afterCount = target.Method.Body.Instructions.Count(instruction =>
+                IsMarkerInstruction(instruction, site.AfterMarker));
+            if (beforeCount != 1 || afterCount != 1
+                || !HasDynamicLogBefore(target.PathLoad, site.BeforeMarker, site.PathKind, logInfo)
+                || !HasDynamicLogAfter(target.Call, site.AfterMarker, site.PathKind, logInfo))
+            {
+                throw new TraceWeaverException(
+                    $"Existing asset-trace instrumentation for {site.Name} is incomplete or duplicated; refusing to modify the assembly.");
+            }
+        }
+        foreach (var site in StaticTraceSites)
+        {
+            var target = staticTargets[site.Name];
+            var beforeCount = target.Method.Body.Instructions.Count(instruction =>
+                IsMarkerInstruction(instruction, site.BeforeMarker));
+            var afterCount = target.Method.Body.Instructions.Count(instruction =>
+                IsMarkerInstruction(instruction, site.AfterMarker));
+            if (beforeCount != 1 || afterCount != 1 || !HasStaticTrace(target, site, logInfo))
+            {
+                throw new TraceWeaverException(
+                    $"Existing diagnostic instrumentation for {site.Name} is incomplete or duplicated; refusing to modify the assembly.");
+            }
+        }
+    }
+
+    private static void InsertStaticTrace(StaticTraceTarget target, StaticTraceSite site, MethodDefinition logInfo)
+    {
+        if (site.BoundaryOnly)
+        {
+            InsertLogCall(target.Processor, target.Entry!, site.BeforeMarker, before: true, logInfo);
+            InsertLogCall(target.Processor, target.Exit!, site.AfterMarker, before: true, logInfo);
+            return;
+        }
+
+        InsertLogCall(target.Processor, target.Call!, site.BeforeMarker, before: true, logInfo);
+        InsertLogCall(target.Processor, target.Call!, site.AfterMarker, before: false, logInfo);
+    }
+
+    private static bool HasStaticTrace(StaticTraceTarget target, StaticTraceSite site, MethodDefinition logInfo)
+    {
+        if (site.BoundaryOnly)
+        {
+            return HasLogSequenceBefore(target.Entry!, site.BeforeMarker, logInfo)
+                && HasLogSequenceBefore(target.Exit!, site.AfterMarker, logInfo);
+        }
+
+        return HasLogSequenceBefore(target.Call!, site.BeforeMarker, logInfo)
+            && HasLogSequenceAfter(target.Call!, site.AfterMarker, logInfo);
+    }
+
+    private static MethodReference FindStringConcat(ModuleDefinition module)
+    {
+        var method = typeof(string).GetMethod(
+            nameof(string.Concat),
+            BindingFlags.Public | BindingFlags.Static,
+            binder: null,
+            new[] { typeof(string), typeof(string) },
+            modifiers: null);
+        if (method is null)
+        {
+            throw new TraceWeaverException("Could not resolve System.String.Concat(System.String,System.String).");
+        }
+
+        return module.ImportReference(method);
+    }
+
+    private static void InsertDynamicLog(
+        ILProcessor processor,
+        Instruction anchor,
+        string marker,
+        AssetTracePathKind pathKind,
+        MethodReference concat,
+        MethodDefinition logInfo,
+        bool before)
+    {
+        var sequence = new[]
+        {
+            processor.Create(OpCodes.Ldstr, marker),
+            CreatePathLoad(processor, pathKind),
+            processor.Create(OpCodes.Call, concat),
+            processor.Create(OpCodes.Ldc_I4_2),
+            processor.Create(OpCodes.Call, processor.Body.Method.Module.ImportReference(logInfo)),
+        };
+
+        if (before)
+        {
+            foreach (var instruction in sequence)
+            {
+                processor.InsertBefore(anchor, instruction);
+            }
+
+            return;
+        }
+
+        var afterAnchor = anchor;
+        foreach (var instruction in sequence)
+        {
+            processor.InsertAfter(afterAnchor, instruction);
+            afterAnchor = instruction;
+        }
+    }
+
+    private static bool HasDynamicLogBefore(
+        Instruction pathLoad,
+        string marker,
+        AssetTracePathKind pathKind,
+        MethodDefinition logInfo)
+    {
+        var logCall = pathLoad.Previous;
+        var logLevel = logCall?.Previous;
+        var concatCall = logLevel?.Previous;
+        var pathClone = concatCall?.Previous;
+        var markerInstruction = pathClone?.Previous;
+        return IsMarkerInstruction(markerInstruction, marker)
+            && IsPathLoad(pathClone, pathKind)
+            && IsConcatCall(concatCall)
+            && IsLdcI4Two(logLevel)
+            && IsLogInfoCall(logCall, logInfo);
+    }
+
+    private static bool HasDynamicLogAfter(
+        Instruction call,
+        string marker,
+        AssetTracePathKind pathKind,
+        MethodDefinition logInfo)
+    {
+        var markerInstruction = call.Next;
+        var pathClone = markerInstruction?.Next;
+        var concatCall = pathClone?.Next;
+        var logLevel = concatCall?.Next;
+        var logCall = logLevel?.Next;
+        return IsMarkerInstruction(markerInstruction, marker)
+            && IsPathLoad(pathClone, pathKind)
+            && IsConcatCall(concatCall)
+            && IsLdcI4Two(logLevel)
+            && IsLogInfoCall(logCall, logInfo);
+    }
+
+    private static bool IsConcatCall(Instruction? instruction) =>
+        instruction?.OpCode.Code == Code.Call
+        && instruction.Operand is MethodReference method
+        && HasSignature(method, "System.String", "Concat", "System.String", "System.String", "System.String");
+
+    private static Instruction CreatePathLoad(ILProcessor processor, AssetTracePathKind pathKind) =>
+        pathKind switch
+        {
+            AssetTracePathKind.Argument1 => processor.Create(OpCodes.Ldarg_1),
+            AssetTracePathKind.Local0 => processor.Create(OpCodes.Ldloc_0),
+            AssetTracePathKind.Local1 => processor.Create(OpCodes.Ldloc_1),
+            AssetTracePathKind.Local2 => processor.Create(OpCodes.Ldloc_2),
+            _ => throw new TraceWeaverException($"Unsupported asset-trace path kind: {pathKind}"),
+        };
+
+    private static bool IsPathLoad(Instruction? instruction, AssetTracePathKind pathKind)
+    {
+        if (instruction is null)
+        {
+            return false;
+        }
+
+        return pathKind switch
+        {
+            AssetTracePathKind.Argument1 => instruction.OpCode.Code == Code.Ldarg_1
+                || ((instruction.OpCode.Code == Code.Ldarg || instruction.OpCode.Code == Code.Ldarg_S)
+                    && instruction.Operand is ParameterDefinition parameter
+                    && parameter.Index == 1),
+            AssetTracePathKind.Local0 => instruction.OpCode.Code == Code.Ldloc_0
+                || IsLocalLoad(instruction, 0),
+            AssetTracePathKind.Local1 => instruction.OpCode.Code == Code.Ldloc_1
+                || IsLocalLoad(instruction, 1),
+            AssetTracePathKind.Local2 => instruction.OpCode.Code == Code.Ldloc_2
+                || IsLocalLoad(instruction, 2),
+            _ => false,
+        };
+    }
+
+    private static bool IsLocalLoad(Instruction instruction, int index) =>
+        (instruction.OpCode.Code == Code.Ldloc || instruction.OpCode.Code == Code.Ldloc_S)
+        && instruction.Operand is VariableDefinition variable
+        && variable.Index == index;
 
     private static MethodDefinition FindExecuteDeferred(ModuleDefinition module)
     {
@@ -424,6 +888,54 @@ public static class TraceWeaver
                 // unique and will be cleaned by the runner's workspace lifecycle.
             }
         }
+    }
+
+    private sealed record AssetTraceTarget(
+        MethodDefinition Method,
+        ILProcessor Processor,
+        Instruction Call,
+        Instruction PathLoad);
+
+    private sealed record StaticTraceTarget(
+        MethodDefinition Method,
+        ILProcessor Processor,
+        Instruction? Call,
+        Instruction? Entry,
+        Instruction? Exit);
+
+    private enum AssetTracePathKind
+    {
+        Argument1,
+        Local0,
+        Local1,
+        Local2,
+    }
+
+    private sealed record AssetTraceSite(
+        string Name,
+        string DeclaringType,
+        string MethodName,
+        string LoaderMethodName,
+        string StageName,
+        AssetTracePathKind PathKind)
+    {
+        public string BeforeMarker => $"PHYS stage={StageName}_begin path=";
+
+        public string AfterMarker => $"PHYS stage={StageName}_end path=";
+    }
+
+    private sealed record StaticTraceSite(
+        string Name,
+        string DeclaringType,
+        string MethodName,
+        string? TargetDeclaringType,
+        string? TargetMethodName,
+        string StageName,
+        bool BoundaryOnly = false)
+    {
+        public string BeforeMarker => $"PHYS stage={StageName}_begin";
+
+        public string AfterMarker => $"PHYS stage={StageName}_end";
     }
 
     private sealed record TraceSite(

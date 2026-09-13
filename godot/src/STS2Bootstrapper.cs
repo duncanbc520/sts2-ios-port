@@ -188,6 +188,13 @@ public partial class STS2Bootstrapper : Node
             System.IO.File.AppendAllText(LogFilePath, $"\n=== STS2 Session Started at {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC ===\n");
             GD.PrintErr($"[STS2Bootstrapper] Logging initialized! Log path: {LogFilePath}");
 
+            if (IsDiagnosticBuild())
+            {
+                var footprintLogPath = System.IO.Path.Combine(userDir, "sts2_physical_footprint.log");
+                IosPhysicalFootprint.StartDiagnosticSampling(footprintLogPath);
+                GD.PrintErr($"[STS2Bootstrapper] Started bounded native physical-footprint timer: {footprintLogPath}");
+            }
+
             // Hook MegaCrit C# Log events
             MegaCrit.Sts2.Core.Logging.Log.LogCallback += (level, text, skipFrames) =>
             {
@@ -247,6 +254,25 @@ public partial class STS2Bootstrapper : Node
         catch (Exception ex)
         {
             GD.PrintErr($"[STS2Bootstrapper] Failed to initialize file logger: {ex}");
+        }
+    }
+
+    private static bool IsDiagnosticBuild()
+    {
+        try
+        {
+            if (OS.GetName() != "iOS" || !FileAccess.FileExists("res://port_build.json"))
+            {
+                return false;
+            }
+
+            using var document = JsonDocument.Parse(FileAccess.GetFileAsString("res://port_build.json"));
+            return document.RootElement.TryGetProperty("port_build_id", out var buildId)
+                && buildId.GetString()?.StartsWith("diag-", StringComparison.Ordinal) == true;
+        }
+        catch
+        {
+            return false;
         }
     }
 
